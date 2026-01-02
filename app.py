@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -7,8 +8,9 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Net Worth Tracker", layout="wide")
 
-# Canonical schema (no include_in_goal anymore)
-BASE_COLS = ["date", "owner", "category", "amount_sek", "amount_usd"]
+# Canonical schema
+BASE_COLS_MAIN = ["date", "owner", "category", "amount_sek", "amount_usd"]
+BASE_COLS_STATIC = ["owner", "category", "amount_sek", "amount_usd"]
 
 VALID_CATEGORIES = {"Cash", "Investments", "Debt", "Real Estate", "Pension"}
 
@@ -19,10 +21,9 @@ def parse_date_col(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.date
 
 def safe_float_series(s: pd.Series) -> pd.Series:
-    # Handles: "35 000,00", "35 000,00", "", etc.
     return (
         s.astype(str)
-        .str.replace("\u00a0", " ", regex=False)   # NBSP -> space
+        .str.replace("\u00a0", " ", regex=False)  # NBSP
         .str.replace(" ", "", regex=False)
         .str.replace(",", ".", regex=False)
         .replace({"": np.nan, "None": np.nan, "nan": np.nan})
@@ -48,15 +49,21 @@ def canonical_category(x: str) -> str:
     }
     return mapping.get(s, s)
 
+def _warn_unknown_categories(df: pd.DataFrame):
+    unknown = sorted(set(df["category"].unique()) - VALID_CATEGORIES)
+    if unknown:
+        st.warning(f"Unknown category values found: {unknown}\nAllowed: {sorted(VALID_CATEGORIES)}")
+
 def read_google_sheet_to_df(sheet_url: str, worksheet: str, sa_json_path: str | None):
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
 
-    if sa_json_path:
+    if sa_json_path and os.path.exists(sa_json_path):
         creds = Credentials.from_service_account_file(sa_json_path, scopes=scopes)
     else:
+        # For Streamlit Cloud: put keys in secrets.toml under [gcp_service_account]
         creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
 
     gc = gspread.authorize(creds)
@@ -70,10 +77,10 @@ def read_google_sheet_to_df(sheet_url: str, worksheet: str, sa_json_path: str | 
     rows = values[1:]
     return pd.DataFrame(rows, columns=header)
 
-def load_and_normalize(df_raw: pd.DataFrame) -> pd.DataFrame:
-    missing = [c for c in BASE_COLS if c not in df_raw.columns]
+def load_and_normalize_main(df_raw: pd.DataFrame) -> pd.DataFrame:
+    missing = [c for c in BASE_COLS_MAIN if c not in df_raw.columns]
     if missing:
-        raise ValueError(f"Missing columns: {missing}. Expected: {BASE_COLS}")
+        raise ValueError(f"Main is missing columns: {missing}. Expected: {BASE_COLS_MAIN}")
 
     df = df_raw.copy()
     df["date"] = parse_date_col(df["date"])
@@ -85,11 +92,57 @@ def load_and_normalize(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["amount_sek"] = safe_float_series(df["amount_sek"])
     df["amount_usd"] = safe_float_series(df["amount_usd"])
 
-    unknown_cats = sorted(set(df["category"].unique()) - VALID_CATEGORIES)
-    if unknown_cats:
-        st.warning(f"Unknown category values found: {unknown_cats}\nAllowed: {sorted(VALID_CATEGORIES)}")
-
+    _warn_unknown_categories(df)
     return df
+
+def load_and_normalize_static(df_raw: pd.DataFrame) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(columns=BASE_COLS_STATIC)
+
+    missing = [c for c in BASE_COLS_STATIC if c not in df_raw.columns]
+    if missing:
+        raise ValueError(f"Static Asset is missing columns: {missing}. Expected: {BASE_COLS_STATIC}")
+
+    df = df_raw.copy()
+    df["owner"] = df["owner"].astype(str).str.strip()
+    df["category"] = df["category"].astype(str).apply(canonical_category)
+
+    df["amount_sek"] = safe_float_series(df["amount_sek"])
+    df["amount_usd"] = safe_float_series(df["amount_usd"])
+
+    _warn_unknown_categories(df)
+    return df
+
+def add_amount_display(df: pd.DataFrame, display_currency: str, fx: float) -> pd.DataFrame:
+    df = df.copy()
+    if display_currency == "SEK":
+        df["amount_display"] = df["amount_sek"].where(df["amount_sek"].notna(), df["amount_usd"] * fx)
+    else:
+        df["amount_display"] = df["amount_usd"].where(df["amount_usd"].notna(), df["amount_sek"] / fx)
+    return df
+
+def combine_snapshot(main_snap: pd.DataFrame, static_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Combine snapshot rows:
+    - Start with static (Debt/Real Estate etc)
+    - Overlay/override with main for same owner+category (so if you *do* enter debt in Main one month, it wins).
+    """
+    if static_df is None or static_df.empty:
+        return main_snap.copy()
+
+    s = static_df.copy()
+    m = main_snap.copy()
+
+    # Mark keys
+    s["_k"] = s["owner"].astype(str) + "||" + s["category"].astype(str)
+    m["_k"] = m["owner"].astype(str) + "||" + m["category"].astype(str)
+
+    # Keep static rows that are NOT overridden by main
+    s_keep = s[~s["_k"].isin(set(m["_k"]))].drop(columns=["_k"])
+    m = m.drop(columns=["_k"])
+
+    combined = pd.concat([m, s_keep], ignore_index=True)
+    return combined
 
 # -----------------------------
 # UI
@@ -101,17 +154,23 @@ with st.sidebar:
 
     data_source = st.radio("Data source", ["Upload CSV", "Google Sheet"], index=0)
 
-    uploaded = None
+    uploaded_main = None
+    uploaded_static = None
+
     sheet_url = ""
-    worksheet_name = "Main"
+    main_ws = "Main"
+    static_ws = "Static Asset"
     sa_path = "secrets/gcp_sa.json"
 
     if data_source == "Upload CSV":
-        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+        uploaded_main = st.file_uploader("Upload MAIN CSV (monthly snapshots)", type=["csv"])
+        uploaded_static = st.file_uploader("Upload STATIC CSV (optional)", type=["csv"])
+        st.caption("Static CSV is for things like Real Estate + Debt that you don't want to re-enter every month.")
     else:
         sheet_url = st.text_input("Google Sheet URL", value="")
-        worksheet_name = st.text_input("Worksheet name (tab)", value="Main")
-        st.caption("Local: put your service account key at secrets/gcp_sa.json")
+        main_ws = st.text_input("Main worksheet (tab)", value="Main")
+        static_ws = st.text_input("Static worksheet (tab)", value="Static Asset")
+        st.caption("Local: service account key at secrets/gcp_sa.json. Cloud: use secrets.toml in Streamlit.")
         sa_path = st.text_input("Service account JSON path (local)", value="secrets/gcp_sa.json")
 
     display_currency = st.radio("Display currency", ["SEK", "USD"], index=0)
@@ -181,48 +240,59 @@ with st.sidebar:
     )
 
 # -----------------------------
-# Load data
+# Load data (Main + Static)
 # -----------------------------
-df_raw = None
+df_main_raw = None
+df_static_raw = None
 
 if data_source == "Upload CSV":
-    if not uploaded:
-        st.info("Upload your CSV to begin.")
+    if not uploaded_main:
+        st.info("Upload your MAIN CSV to begin.")
         st.stop()
-    df_raw = pd.read_csv(uploaded)
+    df_main_raw = pd.read_csv(uploaded_main)
+
+    if uploaded_static:
+        df_static_raw = pd.read_csv(uploaded_static)
+    else:
+        df_static_raw = pd.DataFrame(columns=BASE_COLS_STATIC)
+
 else:
     if not sheet_url.strip():
         st.info("Paste the Google Sheet URL to begin.")
         st.stop()
 
-    try:
-        df_raw = read_google_sheet_to_df(sheet_url, worksheet_name, sa_path.strip() or None)
-    except FileNotFoundError:
-        df_raw = read_google_sheet_to_df(sheet_url, worksheet_name, None)
+    # Main is required
+    df_main_raw = read_google_sheet_to_df(sheet_url, main_ws, sa_path.strip() or None)
 
-    if df_raw is None or df_raw.empty:
-        st.error("Could not read any rows from the Google Sheet. Check sharing + worksheet name.")
+    # Static is optional (if tab missing or empty -> empty df)
+    try:
+        df_static_raw = read_google_sheet_to_df(sheet_url, static_ws, sa_path.strip() or None)
+    except Exception:
+        df_static_raw = pd.DataFrame(columns=BASE_COLS_STATIC)
+
+    if df_main_raw is None or df_main_raw.empty:
+        st.error("Could not read any rows from the MAIN sheet. Check sharing + worksheet name.")
         st.stop()
 
 try:
-    df = load_and_normalize(df_raw)
+    df_main = load_and_normalize_main(df_main_raw)
+    df_static = load_and_normalize_static(df_static_raw)
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-# Display conversion
-if display_currency == "SEK":
-    df["amount_display"] = df["amount_sek"].where(df["amount_sek"].notna(), df["amount_usd"] * fx)
-else:
-    df["amount_display"] = df["amount_usd"].where(df["amount_usd"].notna(), df["amount_sek"] / fx)
+# Add display values
+df_main = add_amount_display(df_main, display_currency, fx)
+df_static = add_amount_display(df_static, display_currency, fx)
 
 # -----------------------------
-# Latest snapshot
+# Latest snapshot (Main latest date + Static overlay)
 # -----------------------------
-latest_date = df["date"].max()
-snap = df[df["date"] == latest_date].copy()
+latest_date = df_main["date"].max()
+main_snap = df_main[df_main["date"] == latest_date].copy()
+snap = combine_snapshot(main_snap, df_static)
 
-# Debt counts negative in net worth math
+# Debt negative in net worth
 snap["signed_amount"] = snap["amount_display"]
 snap.loc[snap["category"] == "Debt", "signed_amount"] = -snap.loc[snap["category"] == "Debt", "amount_display"]
 
@@ -230,7 +300,7 @@ def is_in_networth(row):
     return not (row["category"] == "Pension" and not include_pension_in_networth)
 
 snap["in_networth"] = snap.apply(is_in_networth, axis=1)
-current_networth = snap.loc[snap["in_networth"], "signed_amount"].sum()
+current_networth = float(snap.loc[snap["in_networth"], "signed_amount"].sum())
 
 st.subheader(f"Latest snapshot: {latest_date}")
 c1, c2 = st.columns(2)
@@ -250,7 +320,7 @@ def start_value(cat):
 
 start_cash = start_value("Cash")
 start_inv = start_value("Investments")
-start_debt = start_value("Debt")          # stored positive; subtract in net worth
+start_debt = start_value("Debt")          # stored positive; subtract later
 start_re = start_value("Real Estate")
 start_pension = start_value("Pension")
 
@@ -300,37 +370,32 @@ proj = pd.DataFrame({
 st.divider()
 st.subheader("Projection")
 
-def compute_snapshot_networth(df_snap: pd.DataFrame) -> float:
-    df_snap = df_snap.copy()
+def compute_snapshot_networth_for_date(d) -> float:
+    main_snap_d = df_main[df_main["date"] == d].copy()
+    snap_d = combine_snapshot(main_snap_d, df_static)
 
-    if display_currency == "SEK":
-        df_snap["amount_display"] = df_snap["amount_sek"].where(df_snap["amount_sek"].notna(), df_snap["amount_usd"] * fx)
-    else:
-        df_snap["amount_display"] = df_snap["amount_usd"].where(df_snap["amount_usd"].notna(), df_snap["amount_sek"] / fx)
+    snap_d["signed_amount"] = snap_d["amount_display"]
+    snap_d.loc[snap_d["category"] == "Debt", "signed_amount"] = -snap_d.loc[snap_d["category"] == "Debt", "amount_display"]
 
-    df_snap["signed_amount"] = df_snap["amount_display"]
-    df_snap.loc[df_snap["category"] == "Debt", "signed_amount"] = -df_snap.loc[df_snap["category"] == "Debt", "amount_display"]
+    snap_d["in_networth"] = snap_d.apply(is_in_networth, axis=1)
+    return float(snap_d.loc[snap_d["in_networth"], "signed_amount"].sum())
 
-    # pension default off
-    df_snap["in_networth"] = df_snap.apply(is_in_networth, axis=1)
-    return float(df_snap.loc[df_snap["in_networth"], "signed_amount"].sum())
-
-# Utveckling (actual snapshots)
+# Actual series (Utveckling) from Main dates
 actual_rows = []
-for d in sorted(df["date"].dropna().unique()):
-    nw = compute_snapshot_networth(df[df["date"] == d])
+for d in sorted(df_main["date"].dropna().unique()):
+    nw = compute_snapshot_networth_for_date(d)
     actual_rows.append({"date": pd.to_datetime(d), "value": nw, "series": "Utveckling"})
 actual_df = pd.DataFrame(actual_rows)
 
-# Prognos (forecast from latest snapshot onward)
+# Forecast series (Prognos) from latest snapshot onward
 forecast_df = proj.copy()
 forecast_df["date"] = pd.to_datetime(forecast_df["date"])
 forecast_df = forecast_df[["date", "Net Worth"]].rename(columns={"Net Worth": "value"})
 forecast_df["series"] = "Prognos"
 
-# Sparplan = straight line from earliest snapshot, NO return, just monthly savings
+# Sparplan: straight line from earliest snapshot, no return, just monthly savings
 first_date = actual_df["date"].min().date()
-first_nw = compute_snapshot_networth(df[df["date"] == first_date])
+first_nw = compute_snapshot_networth_for_date(first_date)
 
 plan_dates = [month_add(first_date, int(m)) for m in months]
 plan_df = pd.DataFrame({
@@ -361,7 +426,7 @@ chart = (
 
 st.altair_chart(chart, use_container_width=True)
 
-# Goal ETA based on FORECAST net worth
+# Goal ETA based on forecast net worth
 hit_idx = np.where(networth_forecast >= goal_value)[0]
 if len(hit_idx) > 0:
     m_hit = int(hit_idx[0])
