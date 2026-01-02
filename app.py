@@ -2,9 +2,18 @@ import os
 import pandas as pd
 import numpy as np
 import streamlit as st
-import altair as alt
+import plotly.express as px
 import gspread
 from google.oauth2.service_account import Credentials
+from helper_util import (
+    read_google_sheet_to_df,
+    load_and_normalize_main,
+    load_and_normalize_static,
+    add_amount_display,
+    combine_snapshot,
+    month_add,
+    fmt_money,
+)
 
 st.set_page_config(page_title="Net Worth Tracker", layout="wide")
 
@@ -15,136 +24,6 @@ BASE_COLS_STATIC = ["owner", "category", "amount_sek", "amount_usd"]
 VALID_CATEGORIES = {"Cash", "Investments", "Debt", "Real Estate", "Pension"}
 
 # -----------------------------
-# Helpers
-# -----------------------------
-def parse_date_col(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce").dt.date
-
-def safe_float_series(s: pd.Series) -> pd.Series:
-    return (
-        s.astype(str)
-        .str.replace("\u00a0", " ", regex=False)  # NBSP
-        .str.replace(" ", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .replace({"": np.nan, "None": np.nan, "nan": np.nan})
-        .astype(float)
-    )
-
-def month_add(d, m):
-    return (pd.Period(d, freq="M") + m).to_timestamp().date()
-
-def fmt_money(x):
-    return f"{x:,.0f}".replace(",", " ")
-
-def canonical_category(x: str) -> str:
-    s = str(x).strip()
-    mapping = {
-        "Investment": "Investments",
-        "Investments": "Investments",
-        "Real estate": "Real Estate",
-        "Real Estate": "Real Estate",
-        "Cash": "Cash",
-        "Debt": "Debt",
-        "Pension": "Pension",
-    }
-    return mapping.get(s, s)
-
-def _warn_unknown_categories(df: pd.DataFrame):
-    unknown = sorted(set(df["category"].unique()) - VALID_CATEGORIES)
-    if unknown:
-        st.warning(f"Unknown category values found: {unknown}\nAllowed: {sorted(VALID_CATEGORIES)}")
-
-def read_google_sheet_to_df(sheet_url: str, worksheet: str, sa_json_path: str | None):
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-
-    if sa_json_path and os.path.exists(sa_json_path):
-        creds = Credentials.from_service_account_file(sa_json_path, scopes=scopes)
-    else:
-        # For Streamlit Cloud: put keys in secrets.toml under [gcp_service_account]
-        creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
-
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_url(sheet_url)
-    ws = sh.worksheet(worksheet)
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        return pd.DataFrame()
-
-    header = values[0]
-    rows = values[1:]
-    return pd.DataFrame(rows, columns=header)
-
-def load_and_normalize_main(df_raw: pd.DataFrame) -> pd.DataFrame:
-    missing = [c for c in BASE_COLS_MAIN if c not in df_raw.columns]
-    if missing:
-        raise ValueError(f"Main is missing columns: {missing}. Expected: {BASE_COLS_MAIN}")
-
-    df = df_raw.copy()
-    df["date"] = parse_date_col(df["date"])
-    df = df.dropna(subset=["date"])
-
-    df["owner"] = df["owner"].astype(str).str.strip()
-    df["category"] = df["category"].astype(str).apply(canonical_category)
-
-    df["amount_sek"] = safe_float_series(df["amount_sek"])
-    df["amount_usd"] = safe_float_series(df["amount_usd"])
-
-    _warn_unknown_categories(df)
-    return df
-
-def load_and_normalize_static(df_raw: pd.DataFrame) -> pd.DataFrame:
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=BASE_COLS_STATIC)
-
-    missing = [c for c in BASE_COLS_STATIC if c not in df_raw.columns]
-    if missing:
-        raise ValueError(f"Static Asset is missing columns: {missing}. Expected: {BASE_COLS_STATIC}")
-
-    df = df_raw.copy()
-    df["owner"] = df["owner"].astype(str).str.strip()
-    df["category"] = df["category"].astype(str).apply(canonical_category)
-
-    df["amount_sek"] = safe_float_series(df["amount_sek"])
-    df["amount_usd"] = safe_float_series(df["amount_usd"])
-
-    _warn_unknown_categories(df)
-    return df
-
-def add_amount_display(df: pd.DataFrame, display_currency: str, fx: float) -> pd.DataFrame:
-    df = df.copy()
-    if display_currency == "SEK":
-        df["amount_display"] = df["amount_sek"].where(df["amount_sek"].notna(), df["amount_usd"] * fx)
-    else:
-        df["amount_display"] = df["amount_usd"].where(df["amount_usd"].notna(), df["amount_sek"] / fx)
-    return df
-
-def combine_snapshot(main_snap: pd.DataFrame, static_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Combine snapshot rows:
-    - Start with static (Debt/Real Estate etc)
-    - Overlay/override with main for same owner+category (so if you *do* enter debt in Main one month, it wins).
-    """
-    if static_df is None or static_df.empty:
-        return main_snap.copy()
-
-    s = static_df.copy()
-    m = main_snap.copy()
-
-    # Mark keys
-    s["_k"] = s["owner"].astype(str) + "||" + s["category"].astype(str)
-    m["_k"] = m["owner"].astype(str) + "||" + m["category"].astype(str)
-
-    # Keep static rows that are NOT overridden by main
-    s_keep = s[~s["_k"].isin(set(m["_k"]))].drop(columns=["_k"])
-    m = m.drop(columns=["_k"])
-
-    combined = pd.concat([m, s_keep], ignore_index=True)
-    return combined
-
-# -----------------------------
 # UI
 # -----------------------------
 st.title("Net Worth — Tomas & Carlyn")
@@ -152,12 +31,12 @@ st.title("Net Worth — Tomas & Carlyn")
 with st.sidebar:
     st.header("Data & Scenario")
 
-    data_source = st.radio("Data source", ["Upload CSV", "Google Sheet"], index=0)
+    data_source = st.radio("Data source", ["Google Sheet","Upload CSV"], index=0)
 
     uploaded_main = None
     uploaded_static = None
 
-    sheet_url = ""
+    sheet_url = "https://docs.google.com/spreadsheets/d/1xgeIBBnYeseXoIhXzxPd7GcCE7jszRkpGkwx_VS6NRw/edit?gid=0#gid=0"
     main_ws = "Main"
     static_ws = "Static Asset"
     sa_path = "secrets/gcp_sa.json"
@@ -166,12 +45,6 @@ with st.sidebar:
         uploaded_main = st.file_uploader("Upload MAIN CSV (monthly snapshots)", type=["csv"])
         uploaded_static = st.file_uploader("Upload STATIC CSV (optional)", type=["csv"])
         st.caption("Static CSV is for things like Real Estate + Debt that you don't want to re-enter every month.")
-    else:
-        sheet_url = st.text_input("Google Sheet URL", value="")
-        main_ws = st.text_input("Main worksheet (tab)", value="Main")
-        static_ws = st.text_input("Static worksheet (tab)", value="Static Asset")
-        st.caption("Local: service account key at secrets/gcp_sa.json. Cloud: use secrets.toml in Streamlit.")
-        sa_path = st.text_input("Service account JSON path (local)", value="secrets/gcp_sa.json")
 
     display_currency = st.radio("Display currency", ["SEK", "USD"], index=0)
 
@@ -406,25 +279,33 @@ plan_df = pd.DataFrame({
 
 plot_df = pd.concat([actual_df, forecast_df, plan_df], ignore_index=True)
 
-chart = (
-    alt.Chart(plot_df)
-    .mark_line()
-    .encode(
-        x=alt.X("date:T", title=None),
-        y=alt.Y("value:Q", title=f"Värde ({display_currency})"),
-        color=alt.Color("series:N", sort=["Utveckling", "Prognos", "Sparplan"], legend=alt.Legend(title=None)),
-        strokeDash=alt.StrokeDash(
-            "series:N",
-            sort=["Utveckling", "Prognos", "Sparplan"],
-            scale=alt.Scale(domain=["Utveckling", "Prognos", "Sparplan"], range=[[], [6, 4], [2, 2]]),
-            legend=None,
-        ),
-        tooltip=["series:N", "date:T", alt.Tooltip("value:Q", format=",.0f")],
-    )
-    .properties(height=360)
+# --- Plotly chart (better hover) ---
+plot_df_plotly = plot_df.copy()
+plot_df_plotly["date"] = pd.to_datetime(plot_df_plotly["date"])
+
+fig = px.line(
+    plot_df_plotly,
+    x="date",
+    y="value",
+    color="series",
+    line_dash="series",
+    category_orders={"series": ["Utveckling", "Prognos", "Sparplan"]},
 )
 
-st.altair_chart(chart, use_container_width=True)
+# Nice hover: one tooltip box for all series at that date
+fig.update_traces(mode="lines")
+fig.update_layout(
+    hovermode="x unified",
+    height=420,
+    legend_title_text="",
+    margin=dict(l=10, r=10, t=10, b=10),
+)
+
+# Make y-axis readable
+fig.update_yaxes(tickformat=",.0f")
+
+# Hide the annoying toolbar
+st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 # Goal ETA based on forecast net worth
 hit_idx = np.where(networth_forecast >= goal_value)[0]
