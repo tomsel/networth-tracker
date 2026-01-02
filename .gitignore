@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# secrets / credentials
+secrets/
+.streamlit/secrets.toml
+gcp_sa.json
+
+# local data files (valfritt)
+*.csv
