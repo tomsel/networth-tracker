@@ -108,6 +108,20 @@ def add_amount_display(df: pd.DataFrame, display_currency: str, fx: float) -> pd
     return df
 
 
+def fill_missing_amounts(df: pd.DataFrame, fx: float) -> pd.DataFrame:
+    df = df.copy()
+    if fx <= 0:
+        return df
+
+    sek_missing = df["amount_sek"].isna() & df["amount_usd"].notna()
+    usd_missing = df["amount_usd"].isna() & df["amount_sek"].notna()
+
+    df.loc[sek_missing, "amount_sek"] = df.loc[sek_missing, "amount_usd"] * fx
+    df.loc[usd_missing, "amount_usd"] = df.loc[usd_missing, "amount_sek"] / fx
+
+    return df
+
+
 def combine_snapshot(main_snap: pd.DataFrame, static_df: pd.DataFrame) -> pd.DataFrame:
     if static_df is None or static_df.empty:
         return main_snap.copy()

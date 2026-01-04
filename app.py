@@ -4,16 +4,31 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from helper_util import (
     read_google_sheet_to_df,
     load_and_normalize_main,
     load_and_normalize_static,
+    fill_missing_amounts,
     add_amount_display,
     combine_snapshot,
     month_add,
     fmt_money,
 )
+
+@st.cache_data(ttl=3600)
+def fetch_usd_sek_rate() -> float | None:
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest?from=USD&to=SEK",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return float(payload["rates"]["SEK"])
+    except Exception:
+        return None
 
 st.set_page_config(page_title="Net Worth Tracker", layout="wide")
 page = st.sidebar.radio(
@@ -56,13 +71,19 @@ if page == "Net Worth":
 
         display_currency = st.radio("Display currency", ["SEK", "USD"], index=0)
 
-        fx = st.number_input(
-            "FX rate (SEK per 1 USD)",
-            min_value=0.1,
-            value=10.5,
-            step=0.1,
-            help="Used only for display conversion if one side is missing.",
-        )
+        fx_live = fetch_usd_sek_rate()
+        if fx_live is None:
+            st.warning("Live FX unavailable. Please enter a manual FX rate.")
+            fx = st.number_input(
+                "FX rate (SEK per 1 USD)",
+                min_value=0.1,
+                value=10.5,
+                step=0.1,
+                help="Fallback used only when live FX is unavailable.",
+            )
+        else:
+            fx = fx_live
+            st.caption(f"Live FX: {fx:.4f} SEK per 1 USD")
 
         st.divider()
         st.subheader("Projection assumptions")
@@ -79,7 +100,7 @@ if page == "Net Worth":
             "Cash annual return (%)",
             min_value=-50.0,
             max_value=50.0,
-            value=0.0,
+            value=2.0,
             step=0.5,
         ) / 100.0
 
@@ -161,6 +182,10 @@ if page == "Net Worth":
     except Exception as e:
         st.error(str(e))
         st.stop()
+
+    # Auto-fill missing SEK/USD using the FX rate
+    df_main = fill_missing_amounts(df_main, fx)
+    df_static = fill_missing_amounts(df_static, fx)
 
     # Add display values
     df_main = add_amount_display(df_main, display_currency, fx)
@@ -369,7 +394,7 @@ Required columns:
   - Investments
   - Pension
 - **amount_sek** → Amount in SEK (numbers only)
-- **amount_usd** → Leave empty unless the asset is in USD
+- **amount_usd** → Amount in USD (optional if you filled SEK)
 
 👉 You normally update this **once per month**.
 
@@ -387,7 +412,7 @@ Required columns:
   - Real Estate
   - Debt
 - **amount_sek**
-- **amount_usd**
+- **amount_usd** (optional if you filled SEK)
 
 👉 Only update this sheet if:
 - We buy/sell property

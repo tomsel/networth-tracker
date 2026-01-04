@@ -3,5 +3,5 @@ pandas
 numpy
 gspread
 google-auth
-pandas
 plotly
+requests
